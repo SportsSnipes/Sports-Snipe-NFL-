@@ -7,235 +7,387 @@ import psycopg
 
 
 DATABASE_URL = os.environ["DATABASE_URL"]
+
+# Historical data for model development + current season.
 SEASONS = list(range(2019, 2027))
 
-
-def value(row, *names):
-    for name in names:
-        if name in row.index:
-            return row[name]
-    return None
+UTC = ZoneInfo("UTC")
+EASTERN = ZoneInfo("America/New_York")
 
 
-def clean(value_):
-    if value_ is None:
+def clean(value):
+    """Convert missing/NaN-like values to None while preserving zero."""
+    if value is None:
         return None
 
     try:
-        if value_ != value_:
+        if value != value:
             return None
     except Exception:
         pass
 
-    return value_
+    return value
 
 
-def game_datetime(row):
-    gameday = clean(value(row, "gameday", "game_date"))
-    gametime = clean(value(row, "gametime", "game_time"))
+def first_value(row, *names):
+    """Return the first non-null field that exists."""
+    for name in names:
+        if name in row:
+            value = clean(row[name])
+            if value is not None:
+                return value
 
-    if not gameday:
+    return None
+
+
+def to_int(value):
+    value = clean(value)
+
+    if value is None:
         return None
 
     try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def to_float(value):
+    value = clean(value)
+
+    if value is None:
+        return None
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def game_datetime(row):
+    gameday = first_value(row, "gameday", "game_date")
+    gametime = first_value(row, "gametime", "game_time")
+
+    if gameday is None:
+        return None
+
+    try:
+        gameday = str(gameday)
+
         if gametime:
             local_dt = datetime.fromisoformat(
                 f"{gameday}T{gametime}"
-            ).replace(tzinfo=ZoneInfo("America/New_York"))
+            ).replace(tzinfo=EASTERN)
         else:
-            local_dt = datetime.fromisoformat(gameday).replace(
-                tzinfo=ZoneInfo("America/New_York")
-            )
+            local_dt = datetime.fromisoformat(
+                gameday
+            ).replace(tzinfo=EASTERN)
 
-        return local_dt.astimezone(ZoneInfo("UTC"))
+        return local_dt.astimezone(UTC)
+
     except Exception:
         return None
 
 
+def ensure_team(cur, team_id):
+    """Create a minimal team row if a referenced team does not exist."""
+    team_id = clean(team_id)
+
+    if not team_id:
+        return
+
+    cur.execute(
+        """
+        INSERT INTO teams (
+            team_id,
+            abbreviation
+        )
+        VALUES (%s, %s)
+        ON CONFLICT (team_id)
+        DO NOTHING
+        """,
+        (team_id, team_id),
+    )
+
+
+print("========================================")
+print("Sports Snipe NFL - Base Data Ingestion")
+print("========================================")
+print(f"Seasons: {SEASONS}")
 print("Loading NFL data from nflverse...")
 
 teams = nfl.load_teams()
 players = nfl.load_players()
 schedules = nfl.load_schedules(SEASONS)
+
 player_stats = nfl.load_player_stats(
     SEASONS,
-    summary_level="week"
+    summary_level="week",
 )
 
 print("NFL data loaded.")
+print(f"Teams: {len(teams)}")
+print(f"Players: {len(players)}")
+print(f"Games: {len(schedules)}")
+print(f"Player stat rows: {len(player_stats)}")
 
 with psycopg.connect(DATABASE_URL) as conn:
     with conn.cursor() as cur:
 
-        # -------------------------
+        # ========================================
         # TEAMS
-        # -------------------------
+        # ========================================
+
+        print("Loading teams...")
+
         for row in teams.iter_rows(named=True):
-            team_id = clean(row.get("team_abbr"))
+
+            team_id = first_value(
+                row,
+                "team_abbr",
+                "team_id",
+            )
+
             if not team_id:
                 continue
+
+            team_name = first_value(
+                row,
+                "team_name",
+                "name",
+            )
+
+            conference = first_value(
+                row,
+                "team_conf",
+                "conference",
+            )
+
+            division = first_value(
+                row,
+                "team_division",
+                "division",
+            )
 
             cur.execute(
                 """
                 INSERT INTO teams (
                     team_id,
-                    team_name,
+                    name,
                     abbreviation,
                     conference,
-                    division,
-                    updated_at
+                    division
                 )
-                VALUES (%s,%s,%s,%s,%s,NOW())
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (team_id)
                 DO UPDATE SET
-                    team_name = EXCLUDED.team_name,
+                    name = EXCLUDED.name,
                     abbreviation = EXCLUDED.abbreviation,
                     conference = EXCLUDED.conference,
-                    division = EXCLUDED.division,
-                    updated_at = NOW()
+                    division = EXCLUDED.division
                 """,
                 (
                     team_id,
-                    clean(row.get("team_name")),
+                    team_name,
                     team_id,
-                    clean(row.get("team_conf")),
-                    clean(row.get("team_division")),
+                    conference,
+                    division,
                 ),
             )
 
-        # -------------------------
-        # PLAYERS
-        # -------------------------
-        for row in players.iter_rows(named=True):
-            player_id = clean(row.get("gsis_id"))
+        print("Teams loaded.")
 
-            if not player_id:
-                player_id = clean(row.get("player_id"))
+        # ========================================
+        # PLAYERS
+        # ========================================
+
+        print("Loading players...")
+
+        for row in players.iter_rows(named=True):
+
+            player_id = first_value(
+                row,
+                "gsis_id",
+                "player_id",
+            )
 
             if not player_id:
                 continue
 
-            team_id = clean(
-                row.get("team_abbr")
-                or row.get("team")
+            team_id = first_value(
+                row,
+                "team_abbr",
+                "team",
             )
 
             if team_id:
-                cur.execute(
-                    """
-                    INSERT INTO teams (
-                        team_id,
-                        abbreviation,
-                        updated_at
-                    )
-                    VALUES (%s,%s,NOW())
-                    ON CONFLICT (team_id)
-                    DO NOTHING
-                    """,
-                    (team_id, team_id),
+                ensure_team(cur, team_id)
+
+            player_name = first_value(
+                row,
+                "display_name",
+                "name",
+                "full_name",
+            )
+
+            position = first_value(
+                row,
+                "position",
+                "position_group",
+            )
+
+            jersey_number = to_int(
+                first_value(
+                    row,
+                    "jersey_number",
+                    "jersey",
                 )
+            )
 
-            first_name = clean(row.get("first_name"))
-            last_name = clean(row.get("last_name"))
+            status = first_value(
+                row,
+                "status",
+            )
 
-            player_name = clean(row.get("display_name"))
-
-            if not player_name:
-                player_name = " ".join(
-                    x for x in [first_name, last_name] if x
+            depth_chart_position = to_int(
+                first_value(
+                    row,
+                    "depth_chart_position",
                 )
+            )
+
+            experience = to_int(
+                first_value(
+                    row,
+                    "years",
+                    "experience",
+                )
+            )
+
+            birth_date = first_value(
+                row,
+                "birth_date",
+            )
 
             cur.execute(
                 """
                 INSERT INTO players (
                     player_id,
-                    player_name,
-                    first_name,
-                    last_name,
-                    position,
+                    name,
                     team_id,
+                    position,
                     jersey_number,
                     status,
                     depth_chart_position,
                     experience,
-                    updated_at
+                    birth_date
                 )
                 VALUES (
-                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW()
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s
                 )
                 ON CONFLICT (player_id)
                 DO UPDATE SET
-                    player_name = EXCLUDED.player_name,
-                    first_name = EXCLUDED.first_name,
-                    last_name = EXCLUDED.last_name,
-                    position = EXCLUDED.position,
+                    name = EXCLUDED.name,
                     team_id = EXCLUDED.team_id,
+                    position = EXCLUDED.position,
                     jersey_number = EXCLUDED.jersey_number,
                     status = EXCLUDED.status,
                     depth_chart_position = EXCLUDED.depth_chart_position,
                     experience = EXCLUDED.experience,
+                    birth_date = EXCLUDED.birth_date,
                     updated_at = NOW()
                 """,
                 (
                     player_id,
                     player_name,
-                    first_name,
-                    last_name,
-                    clean(row.get("position")),
                     team_id,
-                    clean(row.get("jersey_number")),
-                    clean(row.get("status")),
-                    clean(row.get("depth_chart_position")),
-                    clean(row.get("years")),
+                    position,
+                    jersey_number,
+                    status,
+                    depth_chart_position,
+                    experience,
+                    birth_date,
                 ),
             )
 
-        # -------------------------
+        print("Players loaded.")
+
+        # ========================================
         # GAMES
-        # -------------------------
+        # ========================================
+
+        print("Loading games...")
+
         for row in schedules.iter_rows(named=True):
-            game_id = clean(row.get("game_id"))
+
+            game_id = first_value(row, "game_id")
 
             if not game_id:
                 continue
 
-            home_team = clean(row.get("home_team"))
-            away_team = clean(row.get("away_team"))
+            home_team = first_value(
+                row,
+                "home_team",
+            )
+
+            away_team = first_value(
+                row,
+                "away_team",
+            )
 
             if not home_team or not away_team:
                 continue
 
-            for team_id in [home_team, away_team]:
-                cur.execute(
-                    """
-                    INSERT INTO teams (
-                        team_id,
-                        abbreviation,
-                        updated_at
-                    )
-                    VALUES (%s,%s,NOW())
-                    ON CONFLICT (team_id)
-                    DO NOTHING
-                    """,
-                    (team_id, team_id),
-                )
+            ensure_team(cur, home_team)
+            ensure_team(cur, away_team)
 
-            total = clean(row.get("total_line"))
-            spread = clean(row.get("spread_line"))
+            total = to_float(
+                first_value(
+                    row,
+                    "total_line",
+                    "total",
+                )
+            )
+
+            spread = to_float(
+                first_value(
+                    row,
+                    "spread_line",
+                    "spread",
+                )
+            )
 
             home_implied = None
             away_implied = None
 
             if total is not None and spread is not None:
-                try:
-                    home_implied = (float(total) - float(spread)) / 2
-                    away_implied = (float(total) + float(spread)) / 2
-                except Exception:
-                    pass
+
+                # NFL schedule spread_line is generally
+                # from the home-team perspective.
+                home_implied = (total - spread) / 2
+                away_implied = (total + spread) / 2
+
+            home_score = to_int(
+                first_value(
+                    row,
+                    "home_score",
+                )
+            )
+
+            away_score = to_int(
+                first_value(
+                    row,
+                    "away_score",
+                )
+            )
 
             status = "scheduled"
 
-            if row.get("result") is not None:
+            if (
+                home_score is not None
+                and away_score is not None
+            ):
                 status = "final"
 
             cur.execute(
@@ -253,11 +405,11 @@ with psycopg.connect(DATABASE_URL) as conn:
                     away_implied_points,
                     home_score,
                     away_score,
-                    status,
-                    updated_at
+                    status
                 )
                 VALUES (
-                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW()
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (game_id)
                 DO UPDATE SET
@@ -272,13 +424,12 @@ with psycopg.connect(DATABASE_URL) as conn:
                     away_implied_points = EXCLUDED.away_implied_points,
                     home_score = EXCLUDED.home_score,
                     away_score = EXCLUDED.away_score,
-                    status = EXCLUDED.status,
-                    updated_at = NOW()
+                    status = EXCLUDED.status
                 """,
                 (
                     game_id,
-                    clean(row.get("season")),
-                    clean(row.get("week")),
+                    to_int(row.get("season")),
+                    to_int(row.get("week")),
                     game_datetime(row),
                     home_team,
                     away_team,
@@ -286,43 +437,48 @@ with psycopg.connect(DATABASE_URL) as conn:
                     total,
                     home_implied,
                     away_implied,
-                    clean(row.get("home_score")),
-                    clean(row.get("away_score")),
+                    home_score,
+                    away_score,
                     status,
                 ),
             )
 
-        # -------------------------
+        print("Games loaded.")
+
+        # ========================================
         # PLAYER GAME STATS
-        # -------------------------
+        # ========================================
+
+        print("Loading player game stats...")
+
+        processed = 0
+
         for row in player_stats.iter_rows(named=True):
 
-            player_id = clean(
-                row.get("player_id")
-                or row.get("gsis_id")
+            player_id = first_value(
+                row,
+                "player_id",
+                "gsis_id",
             )
 
-            game_id = clean(row.get("game_id"))
+            game_id = first_value(
+                row,
+                "game_id",
+            )
 
             if not player_id or not game_id:
                 continue
 
-            team_id = clean(row.get("team"))
+            # Make sure the player exists before
+            # inserting the foreign-key relationship.
+            team_id = first_value(
+                row,
+                "team",
+                "team_abbr",
+            )
 
             if team_id:
-                cur.execute(
-                    """
-                    INSERT INTO teams (
-                        team_id,
-                        abbreviation,
-                        updated_at
-                    )
-                    VALUES (%s,%s,NOW())
-                    ON CONFLICT (team_id)
-                    DO NOTHING
-                    """,
-                    (team_id, team_id),
-                )
+                ensure_team(cur, team_id)
 
                 cur.execute(
                     """
@@ -331,78 +487,183 @@ with psycopg.connect(DATABASE_URL) as conn:
                         updated_at = NOW()
                     WHERE player_id = %s
                     """,
-                    (team_id, player_id),
+                    (
+                        team_id,
+                        player_id,
+                    ),
                 )
 
-            carries = clean(
-                row.get("carries")
-                or row.get("rushing_attempts")
+            season = to_int(
+                first_value(row, "season")
             )
 
-            rushing_yards = clean(
-                row.get("rushing_yards")
-                or row.get("rush_yards")
+            week = to_int(
+                first_value(row, "week")
             )
 
-            receptions = clean(row.get("receptions"))
-
-            receiving_yards = clean(
-                row.get("receiving_yards")
-                or row.get("rec_yards")
+            snaps = to_int(
+                first_value(row, "snaps")
             )
 
-            targets = clean(row.get("targets"))
-
-            pass_attempts = clean(
-                row.get("attempts")
-                or row.get("pass_attempts")
+            snap_share = to_float(
+                first_value(row, "snap_share")
             )
 
-            pass_completions = clean(
-                row.get("completions")
-                or row.get("pass_completions")
+            routes = to_int(
+                first_value(row, "routes")
             )
 
-            pass_yards = clean(
-                row.get("passing_yards")
-                or row.get("pass_yards")
+            route_share = to_float(
+                first_value(row, "route_share")
             )
 
-            rushing_tds = clean(
-                row.get("rushing_tds")
-                or row.get("rush_tds")
-            ) or 0
-
-            receiving_tds = clean(
-                row.get("receiving_tds")
-                or row.get("rec_tds")
-            ) or 0
-
-            passing_tds = clean(
-                row.get("passing_tds")
-                or row.get("pass_tds")
-            ) or 0
-
-            touchdowns = (
-                float(rushing_tds)
-                + float(receiving_tds)
-                + float(passing_tds)
+            targets = to_int(
+                first_value(row, "targets")
             )
 
-            air_yards = clean(
-                row.get("receiving_air_yards")
-                or row.get("air_yards")
+            target_share = to_float(
+                first_value(row, "target_share")
             )
 
-            yac = clean(
-                row.get("receiving_yards_after_catch")
-                or row.get("yards_after_catch")
+            carries = to_int(
+                first_value(
+                    row,
+                    "carries",
+                    "rushing_attempts",
+                )
             )
 
-            epa = clean(
-                row.get("receiving_epa")
-                or row.get("rushing_epa")
-                or row.get("passing_epa")
+            carry_share = to_float(
+                first_value(row, "carry_share")
+            )
+
+            receptions = to_int(
+                first_value(row, "receptions")
+            )
+
+            receiving_yards = to_int(
+                first_value(
+                    row,
+                    "receiving_yards",
+                    "rec_yards",
+                )
+            )
+
+            receiving_tds = to_int(
+                first_value(
+                    row,
+                    "receiving_tds",
+                    "rec_tds",
+                )
+            )
+
+            rush_yards = to_int(
+                first_value(
+                    row,
+                    "rushing_yards",
+                    "rush_yards",
+                )
+            )
+
+            rushing_tds = to_int(
+                first_value(
+                    row,
+                    "rushing_tds",
+                    "rush_tds",
+                )
+            )
+
+            pass_attempts = to_int(
+                first_value(
+                    row,
+                    "attempts",
+                    "pass_attempts",
+                )
+            )
+
+            completions = to_int(
+                first_value(
+                    row,
+                    "completions",
+                    "pass_completions",
+                )
+            )
+
+            pass_yards = to_int(
+                first_value(
+                    row,
+                    "passing_yards",
+                    "pass_yards",
+                )
+            )
+
+            passing_tds = to_int(
+                first_value(
+                    row,
+                    "passing_tds",
+                    "pass_tds",
+                )
+            )
+
+            interceptions = to_int(
+                first_value(
+                    row,
+                    "interceptions",
+                    "ints",
+                )
+            )
+
+            air_yards = to_float(
+                first_value(
+                    row,
+                    "receiving_air_yards",
+                    "air_yards",
+                )
+            )
+
+            yac = to_float(
+                first_value(
+                    row,
+                    "receiving_yards_after_catch",
+                    "yards_after_catch",
+                    "yac",
+                )
+            )
+
+            epa = to_float(
+                first_value(
+                    row,
+                    "receiving_epa",
+                    "rushing_epa",
+                    "passing_epa",
+                    "epa",
+                )
+            )
+
+            success_rate = to_float(
+                first_value(
+                    row,
+                    "success_rate",
+                    "receiving_success_rate",
+                    "rushing_success_rate",
+                    "passing_success_rate",
+                )
+            )
+
+            # Delete the existing player/game row first.
+            # This makes the ingestion safely repeatable
+            # even if the database does not have a
+            # composite UNIQUE constraint.
+            cur.execute(
+                """
+                DELETE FROM player_game_stats
+                WHERE player_id = %s
+                  AND game_id = %s
+                """,
+                (
+                    player_id,
+                    game_id,
+                ),
             )
 
             cur.execute(
@@ -410,60 +671,78 @@ with psycopg.connect(DATABASE_URL) as conn:
                 INSERT INTO player_game_stats (
                     player_id,
                     game_id,
-                    carries,
-                    carry_share,
-                    rush_yards,
+                    season,
+                    week,
+                    snaps,
+                    snap_share,
+                    routes,
+                    route_share,
                     targets,
                     target_share,
+                    carries,
+                    carry_share,
                     receptions,
                     receiving_yards,
+                    receiving_tds,
+                    rush_yards,
+                    rushing_tds,
                     pass_attempts,
-                    pass_completions,
+                    completions,
                     pass_yards,
-                    touchdowns,
+                    passing_tds,
+                    interceptions,
                     air_yards,
-                    yards_after_catch,
-                    epa
+                    yac,
+                    epa,
+                    success_rate
                 )
                 VALUES (
-                    %s,%s,%s,%s,%s,%s,%s,%s,
-                    %s,%s,%s,%s,%s,%s,%s,%s
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s
                 )
-                ON CONFLICT (player_id, game_id)
-                DO UPDATE SET
-                    carries = EXCLUDED.carries,
-                    rush_yards = EXCLUDED.rush_yards,
-                    targets = EXCLUDED.targets,
-                    receptions = EXCLUDED.receptions,
-                    receiving_yards = EXCLUDED.receiving_yards,
-                    pass_attempts = EXCLUDED.pass_attempts,
-                    pass_completions = EXCLUDED.pass_completions,
-                    pass_yards = EXCLUDED.pass_yards,
-                    touchdowns = EXCLUDED.touchdowns,
-                    air_yards = EXCLUDED.air_yards,
-                    yards_after_catch = EXCLUDED.yards_after_catch,
-                    epa = EXCLUDED.epa
                 """,
                 (
                     player_id,
                     game_id,
-                    carries,
-                    None,
-                    rushing_yards,
+                    season,
+                    week,
+                    snaps,
+                    snap_share,
+                    routes,
+                    route_share,
                     targets,
-                    None,
+                    target_share,
+                    carries,
+                    carry_share,
                     receptions,
                     receiving_yards,
+                    receiving_tds,
+                    rush_yards,
+                    rushing_tds,
                     pass_attempts,
-                    pass_completions,
+                    completions,
                     pass_yards,
-                    touchdowns,
+                    passing_tds,
+                    interceptions,
                     air_yards,
                     yac,
                     epa,
+                    success_rate,
                 ),
             )
 
+            processed += 1
+
+            if processed % 5000 == 0:
+                print(
+                    f"Player stats processed: {processed}"
+                )
+
         conn.commit()
 
-print("NFL ingestion completed successfully.")
+print("========================================")
+print("NFL BASE INGESTION COMPLETED")
+print("========================================")
